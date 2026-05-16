@@ -1310,7 +1310,7 @@ async fn share_clipboard_content(
     content: String,
 ) -> Result<()> {
     use crate::clipboard::ClipboardEntry;
-    use crate::network::{ClipboardMessage, NetworkCommand};
+    use crate::network::{ClipboardMessage, ContentType, NetworkCommand};
     use crate::security::{encrypt_content, hash_content};
     use chrono::Utc;
     use tauri::Emitter;
@@ -1352,6 +1352,8 @@ async fn share_clipboard_content(
             timestamp: Utc::now(),
             origin_device_id: identity.device_id.clone(),
             origin_device_name: identity.device_name.clone(),
+            content_type: ContentType::Text,
+            file_meta: None,
         };
 
         // Send via network

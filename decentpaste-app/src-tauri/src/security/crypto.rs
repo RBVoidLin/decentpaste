@@ -8,9 +8,9 @@ use crate::error::{DecentPasteError, Result};
 
 const NONCE_SIZE: usize = 12;
 
-pub fn hash_content(content: &str) -> String {
+pub fn hash_content(content: impl AsRef<[u8]>) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(content.as_bytes());
+    hasher.update(content.as_ref());
     hex::encode(hasher.finalize())
 }
 

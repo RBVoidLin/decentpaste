@@ -18,6 +18,13 @@ export interface ClipboardSyncedFromBackgroundPayload {
   fromDevice: string;
 }
 
+/** Payload for file received from peer */
+export interface FileReceivedPayload {
+  name: string;
+  size: number;
+  originDeviceName: string;
+}
+
 /** Payload for settings changed from system tray */
 export interface SettingsChangedPayload {
   auto_sync_enabled?: boolean;
@@ -42,6 +49,7 @@ interface EventListeners {
   appMinimizedToTray: EventHandler<void>[];
   vaultStatus: EventHandler<VaultStatus>[];
   settingsChanged: EventHandler<SettingsChangedPayload>[];
+  fileReceived: EventHandler<FileReceivedPayload>[];
 }
 
 class EventManager {
@@ -62,6 +70,7 @@ class EventManager {
     appMinimizedToTray: [],
     vaultStatus: [],
     settingsChanged: [],
+    fileReceived: [],
   };
 
   private unlistenFns: UnlistenFn[] = [];
@@ -115,6 +124,9 @@ class EventManager {
       }),
       listen<SettingsChangedPayload>('settings-changed', (e) => {
         this.listeners.settingsChanged.forEach((fn) => fn(e.payload));
+      }),
+      listen<FileReceivedPayload>('file-received', (e) => {
+        this.listeners.fileReceived.forEach((fn) => fn(e.payload));
       }),
     ]);
   }

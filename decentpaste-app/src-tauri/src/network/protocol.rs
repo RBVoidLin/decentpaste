@@ -91,6 +91,28 @@ pub struct ClipboardMessage {
     pub timestamp: DateTime<Utc>,
     pub origin_device_id: String,
     pub origin_device_name: String,
+    #[serde(default = "default_content_type")]
+    pub content_type: ContentType,
+    #[serde(default)]
+    pub file_meta: Option<FileMeta>,
+}
+
+fn default_content_type() -> ContentType {
+    ContentType::Text
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub enum ContentType {
+    #[default]
+    Text,
+    File,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileMeta {
+    pub name: String,
+    pub size: u64,
+    pub mime_type: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

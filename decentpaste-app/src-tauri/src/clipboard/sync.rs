@@ -2,6 +2,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::network::protocol::{ContentType, FileMeta};
 use crate::security::hash_content;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -13,6 +14,10 @@ pub struct ClipboardEntry {
     pub origin_device_id: String,
     pub origin_device_name: String,
     pub is_local: bool,
+    #[serde(default)]
+    pub content_type: ContentType,
+    #[serde(default)]
+    pub file_meta: Option<FileMeta>,
 }
 
 impl ClipboardEntry {
@@ -25,6 +30,8 @@ impl ClipboardEntry {
             origin_device_id: device_id.to_string(),
             origin_device_name: device_name.to_string(),
             is_local: true,
+            content_type: ContentType::Text,
+            file_meta: None,
         }
     }
 
@@ -43,6 +50,8 @@ impl ClipboardEntry {
             origin_device_id: device_id.to_string(),
             origin_device_name: device_name.to_string(),
             is_local: false,
+            content_type: ContentType::Text,
+            file_meta: None,
         }
     }
 

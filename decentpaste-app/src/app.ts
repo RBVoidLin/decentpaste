@@ -839,6 +839,14 @@ class App {
       store.addClipboardEntry(entry);
     });
 
+    eventManager.on('fileReceived', (payload) => {
+      const sizeKB = Math.round(payload.size / 1024);
+      const sizeStr = sizeKB < 1024
+        ? `${sizeKB} KB`
+        : `${(payload.size / (1024 * 1024)).toFixed(1)} MB`;
+      store.addToast(`File received from ${payload.originDeviceName}: ${payload.name} (${sizeStr})`, 'success');
+    });
+
     eventManager.on('pairingRequest', (payload) => {
       store.set('showPairingModal', true);
       store.set('pairingModalMode', 'respond');

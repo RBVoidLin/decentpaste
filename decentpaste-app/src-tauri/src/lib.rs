@@ -13,14 +13,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
+use uuid::Uuid;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-use clipboard::{ClipboardChange, ClipboardEntry, ClipboardMonitor};
-use network::{ClipboardMessage, NetworkCommand, NetworkEvent, NetworkManager};
+use clipboard::{set_clipboard_file, ClipboardChange, ClipboardEntry, ClipboardMonitor};
+use network::{ClipboardMessage, ContentType, NetworkCommand, NetworkEvent, NetworkManager};
 #[cfg(any(target_os = "android", target_os = "ios"))]
 use state::PendingClipboard;
 use state::AppState;
-use storage::{init_data_dir, load_settings};
+use storage::{cleanup_cache, get_data_dir, init_data_dir, init_file_cache, load_settings, save_to_cache};
 use vault::{VaultManager, VaultStatus};
 
 /// Track whether network services have been started (to prevent double-start)
@@ -337,6 +338,15 @@ async fn initialize_app(
     // Initialize data directory first (required for all storage operations)
     init_data_dir(&app_handle)?;
 
+    // Initialize file cache (for clipboard file transfer)
+    let data_dir = get_data_dir()?;
+    init_file_cache(&data_dir)?;
+
+    // Clean up expired cache files on startup
+    if let Err(e) = cleanup_cache() {
+        warn!("Failed to cleanup file cache: {}", e);
+    }
+
     let state = app_handle.state::<AppState>();
 
     // Load settings (always available - not sensitive)
@@ -486,10 +496,9 @@ pub async fn start_network_services(
                     // mid-transmission (race condition). Sync will deliver the message later.
                     let mut broadcast_count = 0;
                     for peer in paired_peers.iter() {
-                        match security::encrypt_content(
-                            change.content.as_bytes(),
-                            &peer.shared_secret,
-                        ) {
+                        // Encrypt content (handles both text and file binary)
+                        let content_bytes = change.content.as_bytes();
+                        match security::encrypt_content(&content_bytes, &peer.shared_secret) {
                             Ok(encrypted) => {
                                 let msg = ClipboardMessage {
                                     id: uuid::Uuid::new_v4().to_string(),
@@ -498,6 +507,8 @@ pub async fn start_network_services(
                                     timestamp: Utc::now(),
                                     origin_device_id: identity.device_id.clone(),
                                     origin_device_name: identity.device_name.clone(),
+                                    content_type: change.content.content_type(),
+                                    file_meta: change.file_meta.clone(),
                                 };
 
                                 // 1. Send via gossipsub (fire-and-forget)
@@ -528,11 +539,18 @@ pub async fn start_network_services(
 
                     if broadcast_count > 0 {
                         // Add to history (once, not per peer)
-                        let entry = ClipboardEntry::new_local(
-                            change.content,
-                            &identity.device_id,
-                            &identity.device_name,
-                        );
+                        let preview = change.content.preview_text();
+                        let entry = ClipboardEntry {
+                            id: Uuid::new_v4().to_string(),
+                            content: preview,
+                            content_hash: change.content_hash.clone(),
+                            timestamp: Utc::now(),
+                            origin_device_id: identity.device_id.clone(),
+                            origin_device_name: identity.device_name.clone(),
+                            is_local: true,
+                            content_type: change.content.content_type(),
+                            file_meta: change.file_meta.clone(),
+                        };
                         state.add_clipboard_entry(entry.clone()).await;
 
                         // Emit to frontend
@@ -1005,76 +1023,131 @@ pub async fn start_network_services(
                     // Check if from paired peer
                     let paired_peers = state.paired_peers.read().await;
 
-                    // Find the peer's shared secret
-                    // Try decrypting with each paired peer's secret until one succeeds
+                    // Find the peer's shared secret and try to decrypt
                     let mut decrypted_successfully = false;
                     for peer in paired_peers.iter() {
                         match security::decrypt_content(&msg.encrypted_content, &peer.shared_secret)
                         {
                             Ok(decrypted) => {
-                                if let Ok(content) = String::from_utf8(decrypted) {
-                                    // Verify hash
-                                    let hash = security::hash_content(&content);
-                                    if hash == msg.content_hash {
-                                        decrypted_successfully = true;
+                                match msg.content_type {
+                                    ContentType::Text => {
+                                        // Handle text content
+                                        if let Ok(content) = String::from_utf8(decrypted) {
+                                            let hash = security::hash_content(&content);
+                                            if hash == msg.content_hash {
+                                                decrypted_successfully = true;
 
-                                        // Check if we should queue for background (mobile only)
-                                        #[cfg(any(target_os = "android", target_os = "ios"))]
-                                        let is_foreground = *state.is_foreground.read().await;
-                                        #[cfg(not(any(target_os = "android", target_os = "ios")))]
-                                        let is_foreground = true;
+                                                // Check if we should queue for background (mobile only)
+                                                #[cfg(any(target_os = "android", target_os = "ios"))]
+                                                let is_foreground = *state.is_foreground.read().await;
+                                                #[cfg(not(any(target_os = "android", target_os = "ios")))]
+                                                let is_foreground = true;
 
-                                        if is_foreground {
-                                            // Update local clipboard directly
-                                            if let Err(e) =
-                                                clipboard::monitor::set_clipboard_content(
-                                                    &app_handle_network,
-                                                    &content,
-                                                )
-                                            {
-                                                error!("Failed to set clipboard: {}", e);
-                                            }
+                                                if is_foreground {
+                                                    // Update local clipboard directly
+                                                    if let Err(e) =
+                                                        clipboard::monitor::set_clipboard_content(
+                                                            &app_handle_network,
+                                                            &content,
+                                                        )
+                                                    {
+                                                        error!("Failed to set clipboard: {}", e);
+                                                    }
 
-                                            // Prevent echo: tell the monitor about this hash
-                                            // so it won't treat it as a local change
-                                            clipboard_monitor.set_last_hash(hash.clone()).await;
-                                        } else {
-                                            // Mobile background: queue clipboard silently (no notification)
-                                            // Clipboard will be copied when app resumes
-                                            #[cfg(any(target_os = "android", target_os = "ios"))]
-                                            {
-                                                info!(
-                                                    "App in background, queuing clipboard from {} (silent)",
-                                                    msg.origin_device_name
-                                                );
-
-                                                // Store pending clipboard - will be processed on resume
-                                                {
-                                                    let mut pending =
-                                                        state.pending_clipboard.write().await;
-                                                    *pending = Some(PendingClipboard {
-                                                        content: content.clone(),
-                                                        from_device: msg.origin_device_name.clone(),
-                                                    });
+                                                    // Prevent echo
+                                                    clipboard_monitor.set_last_hash(hash.clone()).await;
+                                                } else {
+                                                    // Mobile background: queue clipboard silently
+                                                    #[cfg(any(target_os = "android", target_os = "ios"))]
+                                                    {
+                                                        let mut pending = state.pending_clipboard.write().await;
+                                                        *pending = Some(PendingClipboard {
+                                                            content: content.clone(),
+                                                            from_device: msg.origin_device_name.clone(),
+                                                        });
+                                                    }
                                                 }
+
+                                                // Add to history
+                                                let entry = ClipboardEntry {
+                                                    id: Uuid::new_v4().to_string(),
+                                                    content,
+                                                    content_hash: msg.content_hash.clone(),
+                                                    timestamp: msg.timestamp,
+                                                    origin_device_id: msg.origin_device_id.clone(),
+                                                    origin_device_name: msg.origin_device_name.clone(),
+                                                    is_local: false,
+                                                    content_type: ContentType::Text,
+                                                    file_meta: None,
+                                                };
+                                                state.add_clipboard_entry(entry.clone()).await;
+
+                                                // Emit to frontend
+                                                let _ = app_handle_network.emit("clipboard-received", entry);
+                                                break;
                                             }
                                         }
+                                    }
+                                    ContentType::File => {
+                                        // Handle file content
+                                        let hash = security::hash_content(&decrypted);
+                                        if hash == msg.content_hash {
+                                            decrypted_successfully = true;
 
-                                        // Add to history (always, even for duplicates - moved to front)
-                                        let entry = ClipboardEntry::new_remote(
-                                            content,
-                                            msg.content_hash.clone(),
-                                            msg.timestamp,
-                                            &msg.origin_device_id,
-                                            &msg.origin_device_name,
-                                        );
-                                        state.add_clipboard_entry(entry.clone()).await;
+                                            // Get filename from file_meta or use default
+                                            let file_name = msg.file_meta
+                                                .as_ref()
+                                                .map(|m| m.name.clone())
+                                                .unwrap_or_else(|| "file".to_string());
 
-                                        // Emit to frontend
-                                        let _ =
-                                            app_handle_network.emit("clipboard-received", entry);
+                                            // Save to cache
+                                            match save_to_cache(&decrypted, &file_name) {
+                                                Ok(cache_path) => {
+                                                    // Write file to clipboard
+                                                    if let Err(e) = set_clipboard_file(
+                                                        &app_handle_network,
+                                                        &cache_path,
+                                                    ) {
+                                                        error!("Failed to set clipboard file: {}", e);
+                                                    }
 
-                                        break;
+                                                    // Prevent echo
+                                                    clipboard_monitor.set_last_hash(hash.clone()).await;
+
+                                                    // Create history entry with file preview
+                                                    let preview = format!(
+                                                        "[File] {} ({} bytes)",
+                                                        file_name,
+                                                        decrypted.len()
+                                                    );
+                                                    let entry = ClipboardEntry {
+                                                        id: Uuid::new_v4().to_string(),
+                                                        content: preview,
+                                                        content_hash: msg.content_hash.clone(),
+                                                        timestamp: msg.timestamp,
+                                                        origin_device_id: msg.origin_device_id.clone(),
+                                                        origin_device_name: msg.origin_device_name.clone(),
+                                                        is_local: false,
+                                                        content_type: ContentType::File,
+                                                        file_meta: msg.file_meta.clone(),
+                                                    };
+                                                    state.add_clipboard_entry(entry.clone()).await;
+
+                                                    // Emit file-received event to frontend
+                                                    let _ = app_handle_network.emit("file-received", serde_json::json!({
+                                                        "name": file_name,
+                                                        "size": decrypted.len(),
+                                                        "originDeviceName": msg.origin_device_name,
+                                                    }));
+
+                                                    info!("Received file from {}: {}", msg.origin_device_name, file_name);
+                                                }
+                                                Err(e) => {
+                                                    error!("Failed to save file to cache: {}", e);
+                                                }
+                                            }
+                                            break;
+                                        }
                                     }
                                 }
                             }
@@ -1270,57 +1343,124 @@ pub async fn start_network_services(
                             &peer.shared_secret,
                         ) {
                             Ok(decrypted) => {
-                                if let Ok(content) = String::from_utf8(decrypted) {
-                                    // Verify hash
-                                    let hash = security::hash_content(&content);
-                                    if hash == message.content_hash {
-                                        // Check deduplication - don't apply if already in history
-                                        let already_has = {
-                                            let history = state.clipboard_history.read().await;
-                                            history.iter().any(|entry| entry.content_hash == hash)
-                                        };
+                                match message.content_type {
+                                    ContentType::Text => {
+                                        if let Ok(content) = String::from_utf8(decrypted) {
+                                            let hash = security::hash_content(&content);
+                                            if hash == message.content_hash {
+                                                // Check deduplication
+                                                let already_has = {
+                                                    let history = state.clipboard_history.read().await;
+                                                    history.iter().any(|entry| entry.content_hash == hash)
+                                                };
 
-                                        if !already_has {
-                                            // Set clipboard
-                                            if let Err(e) =
-                                                clipboard::monitor::set_clipboard_content(
-                                                    &app_handle_network,
-                                                    &content,
-                                                )
-                                            {
-                                                error!("Failed to set synced clipboard: {}", e);
+                                                if !already_has {
+                                                    // Set clipboard
+                                                    if let Err(e) =
+                                                        clipboard::monitor::set_clipboard_content(
+                                                            &app_handle_network,
+                                                            &content,
+                                                        )
+                                                    {
+                                                        error!("Failed to set synced clipboard: {}", e);
+                                                    }
+
+                                                    // Prevent echo
+                                                    clipboard_monitor.set_last_hash(hash.clone()).await;
+
+                                                    // Add to history with correct timestamp
+                                                    let entry = ClipboardEntry {
+                                                        id: Uuid::new_v4().to_string(),
+                                                        content,
+                                                        content_hash: message.content_hash.clone(),
+                                                        timestamp: message.timestamp,
+                                                        origin_device_id: message.origin_device_id.clone(),
+                                                        origin_device_name: message.origin_device_name.clone(),
+                                                        is_local: false,
+                                                        content_type: ContentType::Text,
+                                                        file_meta: None,
+                                                    };
+                                                    state.add_clipboard_entry(entry.clone()).await;
+
+                                                    let _ = app_handle_network.emit("clipboard-received", entry);
+
+                                                    info!(
+                                                        "Synced clipboard from {} (hash: {})",
+                                                        message.origin_device_name,
+                                                        &hash[..8.min(hash.len())]
+                                                    );
+                                                } else {
+                                                    debug!("Synced message already in history (deduplicated)");
+                                                }
+                                            } else {
+                                                warn!("Hash mismatch in synced message from {}", peer_id);
                                             }
-
-                                            // Prevent echo
-                                            clipboard_monitor.set_last_hash(hash.clone()).await;
-
-                                            // Add to history with correct timestamp
-                                            let entry = ClipboardEntry::new_remote(
-                                                content,
-                                                message.content_hash.clone(),
-                                                message.timestamp,
-                                                &message.origin_device_id,
-                                                &message.origin_device_name,
-                                            );
-                                            // Use add_clipboard_entry which handles chronological insertion
-                                            state.add_clipboard_entry(entry.clone()).await;
-
-                                            // Emit to frontend (use same event as regular clipboard-received)
-                                            let _ = app_handle_network
-                                                .emit("clipboard-received", entry);
-
-                                            info!(
-                                                "Synced clipboard from {} (hash: {})",
-                                                message.origin_device_name,
-                                                &hash[..8.min(hash.len())]
-                                            );
-                                        } else {
-                                            debug!(
-                                                "Synced message already in history (deduplicated)"
-                                            );
                                         }
-                                    } else {
-                                        warn!("Hash mismatch in synced message from {}", peer_id);
+                                    }
+                                    ContentType::File => {
+                                        let hash = security::hash_content(&decrypted);
+                                        if hash == message.content_hash {
+                                            // Check deduplication
+                                            let already_has = {
+                                                let history = state.clipboard_history.read().await;
+                                                history.iter().any(|entry| entry.content_hash == hash)
+                                            };
+
+                                            if !already_has {
+                                                // Get filename
+                                                let file_name = message.file_meta
+                                                    .as_ref()
+                                                    .map(|m| m.name.clone())
+                                                    .unwrap_or_else(|| "file".to_string());
+
+                                                // Save to cache
+                                                match save_to_cache(&decrypted, &file_name) {
+                                                    Ok(cache_path) => {
+                                                        // Write to clipboard
+                                                        if let Err(e) = set_clipboard_file(
+                                                            &app_handle_network,
+                                                            &cache_path,
+                                                        ) {
+                                                            error!("Failed to set synced clipboard file: {}", e);
+                                                        }
+
+                                                        // Prevent echo
+                                                        clipboard_monitor.set_last_hash(hash.clone()).await;
+
+                                                        // History entry with file preview
+                                                        let preview = format!(
+                                                            "[File] {} ({} bytes)",
+                                                            file_name,
+                                                            decrypted.len()
+                                                        );
+                                                        let entry = ClipboardEntry {
+                                                            id: Uuid::new_v4().to_string(),
+                                                            content: preview,
+                                                            content_hash: message.content_hash.clone(),
+                                                            timestamp: message.timestamp,
+                                                            origin_device_id: message.origin_device_id.clone(),
+                                                            origin_device_name: message.origin_device_name.clone(),
+                                                            is_local: false,
+                                                            content_type: ContentType::File,
+                                                            file_meta: message.file_meta.clone(),
+                                                        };
+                                                        state.add_clipboard_entry(entry.clone()).await;
+
+                                                        // Emit file-received event
+                                                        let _ = app_handle_network.emit("file-received", serde_json::json!({
+                                                            "name": file_name,
+                                                            "size": decrypted.len(),
+                                                            "originDeviceName": message.origin_device_name,
+                                                        }));
+
+                                                        info!("Synced file from {}: {}", message.origin_device_name, file_name);
+                                                    }
+                                                    Err(e) => {
+                                                        error!("Failed to save synced file to cache: {}", e);
+                                                    }
+                                                }
+                                            }
+                                        }
                                     }
                                 }
                             }
