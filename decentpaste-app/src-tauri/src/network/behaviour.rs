@@ -8,6 +8,7 @@ use libp2p::{
 };
 use std::time::Duration;
 
+use super::media_codec::{MediaCodec, MEDIA_PROTOCOL};
 use super::protocol::ProtocolMessage;
 
 const PROTOCOL_NAME: &str = "/decentpaste/1.0.0";
@@ -100,6 +101,7 @@ pub struct DecentPasteBehaviour {
     pub mdns: mdns::tokio::Behaviour,
     pub gossipsub: gossipsub::Behaviour,
     pub request_response: request_response::Behaviour<DecentPasteCodec>,
+    pub media: request_response::Behaviour<MediaCodec>,
     pub identify: identify::Behaviour,
 }
 
@@ -124,6 +126,8 @@ impl DecentPasteBehaviour {
             // Use 1-second heartbeat for faster mesh building after reconnection
             // This is important for quick clipboard sync after peer restart
             .heartbeat_interval(Duration::from_secs(1))
+            // Media bytes go over the media protocol; this only needs to fit text and manifests.
+            .max_transmit_size(1024 * 1024)
             .validation_mode(gossipsub::ValidationMode::Strict)
             .message_id_fn(|message| {
                 // For clipboard messages: use the message's own UUID as the MessageId
@@ -154,6 +158,12 @@ impl DecentPasteBehaviour {
             request_response::Config::default(),
         );
 
+        // Request-response for pulling media chunks (binary, chunked)
+        let media = request_response::Behaviour::new(
+            [(StreamProtocol::new(MEDIA_PROTOCOL), ProtocolSupport::Full)],
+            request_response::Config::default().with_request_timeout(Duration::from_secs(30)),
+        );
+
         // Identify for peer identification
         // Format: "decentpaste/<version>/<device_name>"
         // The device name is included so other peers can display a human-readable name
@@ -167,6 +177,7 @@ impl DecentPasteBehaviour {
             mdns,
             gossipsub,
             request_response,
+            media,
             identify,
         })
     }

@@ -8,7 +8,7 @@ use libp2p::{
 };
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, error, info, warn};
 
 use super::behaviour::{
@@ -16,6 +16,7 @@ use super::behaviour::{
     PairingResponse as ReqPairingResponse,
 };
 use super::events::{ConnectedPeer, DiscoveredPeer, NetworkEvent, NetworkStatus};
+use super::media_codec::{MediaChunkRequest, MediaChunkResponse};
 use super::protocol::{ClipboardMessage, DeviceAnnounceMessage, PairingMessage, ProtocolMessage};
 
 #[derive(Debug)]
@@ -100,6 +101,19 @@ pub enum NetworkCommand {
         peer_id: String,
         message: super::protocol::ClipboardMessage,
     },
+
+    /// Pull one media chunk from a peer. The result (or transport error) is sent on `reply`.
+    RequestMediaChunk {
+        peer_id: String,
+        request: MediaChunkRequest,
+        reply: oneshot::Sender<Result<MediaChunkResponse, String>>,
+    },
+
+    /// Answer an inbound media chunk request (see `NetworkEvent::MediaChunkRequested`).
+    SendMediaChunk {
+        key: u64,
+        response: MediaChunkResponse,
+    },
 }
 
 pub struct NetworkManager {
@@ -118,6 +132,12 @@ pub struct NetworkManager {
     pending_pairing_requests: HashMap<OutboundRequestId, String>,
     /// Cache device names that arrive (via Identify or DeviceAnnounce) before mDNS creates the peer entry
     pending_device_names: HashMap<PeerId, String>,
+    /// Outbound media chunk requests awaiting a response.
+    pending_media_requests:
+        HashMap<OutboundRequestId, oneshot::Sender<Result<MediaChunkResponse, String>>>,
+    /// Inbound media chunk requests waiting for the app to supply the chunk.
+    pending_media_responses: HashMap<u64, ResponseChannel<MediaChunkResponse>>,
+    next_media_key: u64,
 }
 
 impl NetworkManager {
@@ -156,6 +176,9 @@ impl NetworkManager {
             device_name,
             pending_pairing_requests: HashMap::new(),
             pending_device_names: HashMap::new(),
+            pending_media_requests: HashMap::new(),
+            pending_media_responses: HashMap::new(),
+            next_media_key: 0,
         })
     }
 
@@ -693,6 +716,52 @@ impl NetworkManager {
                 }
             }
 
+            SwarmEvent::Behaviour(super::behaviour::DecentPasteBehaviourEvent::Media(event)) => {
+                match event {
+                    request_response::Event::Message { peer, message, .. } => match message {
+                        request_response::Message::Request {
+                            request, channel, ..
+                        } => {
+                            let key = self.next_media_key;
+                            self.next_media_key = self.next_media_key.wrapping_add(1);
+                            self.pending_media_responses.insert(key, channel);
+                            let _ = self
+                                .event_tx
+                                .send(NetworkEvent::MediaChunkRequested {
+                                    key,
+                                    peer_id: peer.to_string(),
+                                    sha256: request.sha256,
+                                    index: request.index,
+                                })
+                                .await;
+                        }
+                        request_response::Message::Response {
+                            request_id,
+                            response,
+                        } => {
+                            if let Some(reply) = self.pending_media_requests.remove(&request_id) {
+                                let _ = reply.send(Ok(response));
+                            }
+                        }
+                    },
+                    request_response::Event::OutboundFailure {
+                        peer,
+                        request_id,
+                        error,
+                        ..
+                    } => {
+                        warn!("Media chunk request to {} failed: {}", peer, error);
+                        if let Some(reply) = self.pending_media_requests.remove(&request_id) {
+                            let _ = reply.send(Err(error.to_string()));
+                        }
+                    }
+                    request_response::Event::InboundFailure { peer, error, .. } => {
+                        warn!("Inbound media request from {} failed: {}", peer, error);
+                    }
+                    request_response::Event::ResponseSent { .. } => {}
+                }
+            }
+
             SwarmEvent::Behaviour(super::behaviour::DecentPasteBehaviourEvent::Identify(
                 identify::Event::Received { peer_id, info, .. },
             )) => {
@@ -820,6 +889,38 @@ impl NetworkManager {
 
     async fn handle_command(&mut self, command: NetworkCommand) {
         match command {
+            NetworkCommand::RequestMediaChunk {
+                peer_id,
+                request,
+                reply,
+            } => match peer_id.parse::<PeerId>() {
+                Ok(peer) => {
+                    let request_id = self
+                        .swarm
+                        .behaviour_mut()
+                        .media
+                        .send_request(&peer, request);
+                    self.pending_media_requests.insert(request_id, reply);
+                }
+                Err(e) => {
+                    let _ = reply.send(Err(format!("invalid peer id: {}", e)));
+                }
+            },
+
+            NetworkCommand::SendMediaChunk { key, response } => {
+                if let Some(channel) = self.pending_media_responses.remove(&key) {
+                    if self
+                        .swarm
+                        .behaviour_mut()
+                        .media
+                        .send_response(channel, response)
+                        .is_err()
+                    {
+                        debug!("Media chunk requester went away before the response was sent");
+                    }
+                }
+            }
+
             NetworkCommand::BroadcastClipboard { message } => {
                 let protocol_msg = ProtocolMessage::Clipboard(message.clone());
                 match self.swarm.behaviour_mut().publish_clipboard(&protocol_msg) {

@@ -157,7 +157,16 @@ class App {
         const history = store.get('clipboardHistory');
         const item = history.find((h) => h.id === id);
         if (item) {
-          await commands.setClipboard(item.content);
+          try {
+            if (item.media) {
+              await commands.copyMediaToClipboard(item.id);
+            } else {
+              await commands.setClipboard(item.content);
+            }
+          } catch (error) {
+            store.addToast(`Failed to copy: ${getErrorMessage(error)}`, 'error');
+            return;
+          }
 
           // Visual feedback: change to checkmark with green tint
           const button = copyEl as HTMLElement;
@@ -169,6 +178,20 @@ class App {
             button.innerHTML = icon('copy', 16);
             button.classList.remove('copied');
           }, 800);
+        }
+        return;
+      }
+
+      // Media download buttons (items above the auto-download threshold, or retries)
+      const downloadEl = target.closest('[data-download]');
+      if (downloadEl) {
+        const id = downloadEl.getAttribute('data-download');
+        if (id) {
+          try {
+            await commands.downloadMedia(id);
+          } catch {
+            // Failure is reported through the 'media-error' event
+          }
         }
         return;
       }
@@ -201,10 +224,7 @@ class App {
             this.pairingTimeout = setTimeout(() => {
               const session = store.get('activePairingSession');
               if (session && session.state === 'Initiated') {
-                store.addToast(
-                  'Pairing timed out. Make sure the other device is nearby and the app is open.',
-                  'error',
-                );
+                store.addToast('Pairing timed out. Make sure the other device is nearby and the app is open.', 'error');
                 store.set('showPairingModal', false);
                 store.set('activePairingSession', null);
                 commands.cancelPairing(session.session_id).catch(() => {});
@@ -839,12 +859,28 @@ class App {
       store.addClipboardEntry(entry);
     });
 
-    eventManager.on('fileReceived', (payload) => {
-      const sizeKB = Math.round(payload.size / 1024);
-      const sizeStr = sizeKB < 1024
-        ? `${sizeKB} KB`
-        : `${(payload.size / (1024 * 1024)).toFixed(1)} MB`;
-      store.addToast(`File received from ${payload.originDeviceName}: ${payload.name} (${sizeStr})`, 'success');
+    eventManager.on('clipboardEntryUpdated', (entry) => {
+      const previous = store.get('clipboardHistory').find((e) => e.id === entry.id);
+      store.updateClipboardEntry(entry);
+      if (previous?.media?.status === 'Downloading' && entry.media?.status === 'Ready') {
+        store.addToast(`${entry.media.manifest.name} from ${entry.origin_device_name} is ready to paste`, 'success');
+      }
+    });
+
+    // Progress updates the bar in place; a full list re-render per chunk would be wasteful.
+    eventManager.on('mediaProgress', ({ entryId, received, total }) => {
+      const bar = document.querySelector<HTMLElement>(`[data-progress="${CSS.escape(entryId)}"]`);
+      if (bar && total > 0) {
+        bar.style.width = `${Math.min(100, Math.round((received / total) * 100))}%`;
+      }
+    });
+
+    eventManager.on('mediaError', ({ name, error }) => {
+      store.addToast(`Failed to download ${name}: ${error}`, 'error', 5000);
+    });
+
+    eventManager.on('mediaTooLarge', ({ name, size }) => {
+      store.addToast(`${name} (${formatBytes(size)}) is over the 100 MB limit and was not shared`, 'error', 5000);
     });
 
     eventManager.on('pairingRequest', (payload) => {
@@ -2010,17 +2046,69 @@ class App {
                 ${isLocal ? 'Local' : escapeHtml(item.origin_device_name)}
               </span>
               <span class="text-xs text-white/30 font-mono">${formatTime(item.timestamp)}</span>
+              ${item.media ? this.renderMediaStatus(item) : ''}
             </div>
+            ${
+              item.media?.status === 'Downloading'
+                ? `<div class="mt-2 h-1 rounded-full bg-white/10 overflow-hidden">
+                     <div data-progress="${item.id}" class="h-full bg-teal-400 transition-all" style="width: 0%"></div>
+                   </div>`
+                : ''
+            }
           </div>
-          <button
-            data-copy="${item.id}"
-            class="copy-btn p-2 rounded-lg text-white/30 hover:text-teal-400 hover:bg-teal-500/10 transition-all flex-shrink-0"
-            title="Copy to clipboard"
-          >
-            ${icon('copy', 16)}
-          </button>
+          ${this.renderClipboardItemAction(item)}
         </div>
       </div>
+    `;
+  }
+
+  private mediaIcon(item: ClipboardEntry): IconName {
+    const manifest = item.media?.manifest;
+    if (manifest?.kind === 'Image' || manifest?.mime_type.startsWith('image/')) return 'image';
+    if (manifest?.mime_type.startsWith('video/')) return 'film';
+    return 'file';
+  }
+
+  private renderMediaStatus(item: ClipboardEntry): string {
+    const media = item.media!;
+    const labels: Record<string, string> = {
+      Pending: 'Not downloaded',
+      Downloading: 'Downloading…',
+      Ready: '',
+      Failed: 'Download failed',
+      Expired: 'No longer available',
+    };
+    const label = labels[media.status] ?? '';
+    return `
+      <span class="inline-flex items-center gap-1 text-xs text-white/40">
+        ${icon(this.mediaIcon(item), 10)}
+        ${formatBytes(media.manifest.size)}${label ? ` · ${label}` : ''}
+      </span>
+    `;
+  }
+
+  private renderClipboardItemAction(item: ClipboardEntry): string {
+    const status = item.media?.status;
+    const buttonClass =
+      'p-2 rounded-lg text-white/30 hover:text-teal-400 hover:bg-teal-500/10 transition-all flex-shrink-0';
+
+    if (status === 'Downloading') {
+      return `<span class="p-2 text-white/30 flex-shrink-0 animate-spin">${icon('loader', 16)}</span>`;
+    }
+    if (status === 'Expired') {
+      return '';
+    }
+    if (status === 'Pending' || status === 'Failed') {
+      return `
+        <button data-download="${item.id}" class="${buttonClass}" title="Download">
+          ${icon(status === 'Failed' ? 'refreshCw' : 'download', 16)}
+        </button>
+      `;
+    }
+    return `
+      <button data-copy="${item.id}" class="copy-btn ${buttonClass}" title="Copy to clipboard">
+        ${icon('copy', 16)}
+      </button>
     `;
   }
 

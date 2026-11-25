@@ -18,11 +18,24 @@ export interface ClipboardSyncedFromBackgroundPayload {
   fromDevice: string;
 }
 
-/** Payload for file received from peer */
-export interface FileReceivedPayload {
+/** Download progress for a media entry */
+export interface MediaProgressPayload {
+  entryId: string;
+  received: number;
+  total: number;
+}
+
+/** A media download failed */
+export interface MediaErrorPayload {
+  entryId: string;
+  name: string;
+  error: string;
+}
+
+/** Copied media exceeds the transfer limit */
+export interface MediaTooLargePayload {
   name: string;
   size: number;
-  originDeviceName: string;
 }
 
 /** Payload for settings changed from system tray */
@@ -49,7 +62,10 @@ interface EventListeners {
   appMinimizedToTray: EventHandler<void>[];
   vaultStatus: EventHandler<VaultStatus>[];
   settingsChanged: EventHandler<SettingsChangedPayload>[];
-  fileReceived: EventHandler<FileReceivedPayload>[];
+  clipboardEntryUpdated: EventHandler<ClipboardEntry>[];
+  mediaProgress: EventHandler<MediaProgressPayload>[];
+  mediaError: EventHandler<MediaErrorPayload>[];
+  mediaTooLarge: EventHandler<MediaTooLargePayload>[];
 }
 
 class EventManager {
@@ -70,7 +86,10 @@ class EventManager {
     appMinimizedToTray: [],
     vaultStatus: [],
     settingsChanged: [],
-    fileReceived: [],
+    clipboardEntryUpdated: [],
+    mediaProgress: [],
+    mediaError: [],
+    mediaTooLarge: [],
   };
 
   private unlistenFns: UnlistenFn[] = [];
@@ -125,8 +144,17 @@ class EventManager {
       listen<SettingsChangedPayload>('settings-changed', (e) => {
         this.listeners.settingsChanged.forEach((fn) => fn(e.payload));
       }),
-      listen<FileReceivedPayload>('file-received', (e) => {
-        this.listeners.fileReceived.forEach((fn) => fn(e.payload));
+      listen<ClipboardEntry>('clipboard-entry-updated', (e) => {
+        this.listeners.clipboardEntryUpdated.forEach((fn) => fn(e.payload));
+      }),
+      listen<MediaProgressPayload>('media-progress', (e) => {
+        this.listeners.mediaProgress.forEach((fn) => fn(e.payload));
+      }),
+      listen<MediaErrorPayload>('media-error', (e) => {
+        this.listeners.mediaError.forEach((fn) => fn(e.payload));
+      }),
+      listen<MediaTooLargePayload>('media-too-large', (e) => {
+        this.listeners.mediaTooLarge.forEach((fn) => fn(e.payload));
       }),
     ]);
   }

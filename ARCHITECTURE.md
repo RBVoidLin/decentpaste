@@ -557,6 +557,43 @@ Single-file application with authentication and main views:
 6. Device B decrypts with shared secret, verifies hash
 7. Device B's clipboard is updated, last_hash set to prevent echo
 
+### Media (Image / File) Sync Flow — desktop only
+
+Media splits the **control plane** (what was copied) from the **data plane** (the bytes):
+
+- **Control plane**: the sender broadcasts a normal `ClipboardMessage` with `content_type: Image | File`, but
+  `encrypted_content` holds an encrypted `MediaManifest` (name, size, MIME, SHA-256, chunk layout) instead of the
+  bytes. It rides gossipsub and the offline Sync buffer unchanged, so both stay small.
+- **Data plane**: the receiver pulls 1 MiB AES-GCM chunks over a separate request-response protocol,
+  `/decentpaste/media/1.0.0` (`network/media_codec.rs`), with a binary codec (no JSON).
+
+```mermaid
+sequenceDiagram
+    participant A as Sender
+    participant B as Receiver
+    A->>A: ClipboardMonitor (clipboard-rs watcher) sees file / image
+    A->>A: OutgoingMediaRegistry.register(path, manifest, paired peers)
+    A->>B: gossipsub ClipboardMessage {target_peer_id, enc(MediaManifest)}
+    Note over B: history entry (Pending). ≤ 20 MB → download now, else "Download" button
+    loop chunk 0..chunk_count
+        B->>A: MediaChunkRequest {sha256, index}
+        A-->>B: AES-GCM(chunk, AAD = sha256‖index)
+    end
+    B->>B: verify SHA-256 → file_cache/<uuid>/<name> → write to system clipboard
+```
+
+| Piece                                 | Role                                                                           |
+|---------------------------------------|--------------------------------------------------------------------------------|
+| `clipboard/file_ops.rs`               | `clipboard-rs` access. Read priority: file → text → image                      |
+| `clipboard/monitor.rs`                | Event-driven watcher; images become PNG in the cache; files are hashed lazily |
+| `media/outgoing.rs`                   | What we offered, to whom (10 items / 60 min)                                   |
+| `media/download.rs`                   | Pulling chunks, serving chunks, writing media to the clipboard                |
+| `MediaInfo` on `ClipboardEntry`       | `Pending → Downloading → Ready` (or `Failed` / `Expired`)                      |
+
+Limits: 100 MB per item (`MAX_MEDIA_SIZE`), auto-download ≤ 20 MB (`AUTO_DOWNLOAD_THRESHOLD`), one download at a
+time. Echo prevention uses the file's SHA-256 for files and a pixel fingerprint (`image_fingerprint`) for images,
+because an image written to the clipboard can come back re-encoded.
+
 ### Pairing Flow (with X25519 ECDH Key Exchange)
 
 ```mermaid
@@ -811,7 +848,8 @@ yarn build
 
 ## Known Limitations & Future Work
 
-1. **Text-only clipboard**: Currently only supports text. Images/files could be added.
+1. **Media clipboard is desktop-only (macOS / Windows)**: Images and single files up to 100 MB. Not yet: mobile,
+   Linux, multiple files, folders, thumbnails, resuming a transfer after restart.
 2. **Local network only**: Uses mDNS, so devices must be on same network. Internet relay could be added.
 3. **Mobile clipboard (outgoing)**: On Android/iOS, automatic clipboard monitoring is not supported. Users must use the system share sheet from any app to share directly (via `tauri-plugin-decentshare` - works on both Android and iOS)
 4. **Mobile clipboard (incoming)**: Clipboard only syncs when the app is in foreground. Network connections drop when

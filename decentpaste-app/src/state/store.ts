@@ -234,6 +234,11 @@ class Store {
     });
   }
 
+  /** Replace an entry in place (e.g. a media download changed status). */
+  updateClipboardEntry(entry: ClipboardEntry): void {
+    this.update('clipboardHistory', (history) => history.map((e) => (e.id === entry.id ? entry : e)));
+  }
+
   addDiscoveredPeer(peer: DiscoveredPeer): void {
     this.update('discoveredPeers', (peers) => {
       const existing = peers.findIndex((p) => p.peer_id === peer.peer_id);

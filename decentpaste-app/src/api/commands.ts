@@ -130,6 +130,15 @@ export async function setClipboard(content: string): Promise<void> {
   return invoke('set_clipboard', { content });
 }
 
+// Media transfer
+export async function downloadMedia(entryId: string): Promise<ClipboardEntry> {
+  return invoke('download_media', { entryId });
+}
+
+export async function copyMediaToClipboard(entryId: string): Promise<void> {
+  return invoke('copy_media_to_clipboard', { entryId });
+}
+
 export async function clearClipboardHistory(): Promise<void> {
   return invoke('clear_clipboard_history');
 }

@@ -120,6 +120,20 @@ Content is encrypted **separately for each paired peer** using their specific sh
 - Compromising one pairing doesn't affect others
 - Each relationship has cryptographic isolation
 
+### Media Transfer (Images / Files)
+
+- **Manifest is encrypted**: file name, size and type travel inside the per-peer encrypted `MediaManifest`; only the
+  SHA-256 is visible in the gossipsub message (as with text).
+- **Chunks are bound to their position**: each 1 MiB chunk is AES-256-GCM encrypted with the pair's shared secret and
+  AAD = `sha256 ‖ chunk index`, so chunks cannot be reordered or spliced in from another transfer. The receiver also
+  verifies the full SHA-256 before using the file.
+- **Pull authorization**: a sender serves chunks only to paired peers the item was offered to, only for 60 minutes,
+  and stops serving a peer as soon as it is unpaired.
+- **Untrusted metadata**: manifests are validated (size ≤ 100 MB, chunk layout consistent) and peer-supplied file
+  names are sanitized (no path components, Windows reserved names and characters removed).
+- **Plaintext on disk**: pasting needs a real file, so received media is stored **unencrypted** in the app data
+  directory (`file_cache/`). The cache is wiped on every app start and capped at 500 MB per session.
+
 ---
 
 ## Secure Vault Storage
@@ -222,6 +236,7 @@ This is a deliberate security choice — your clipboard data never traverses the
 
 | Date       | Change                                                                                                                |
 |------------|-----------------------------------------------------------------------------------------------------------------------|
+| 2026-11-25 | Added: Encrypted, chunked media transfer (images / files) with per-chunk AAD and pull authorization          |
 | 2026-01-11 | Added: Hardware-backed vault security (biometrics, TEE, Keychain) via `tauri-plugin-decentsecret`                     |
 | 2026-01-01 | Fixed: Shared secret no longer transmitted during pairing ([#25](https://github.com/decentpaste/decentpaste/pull/25)) |
 

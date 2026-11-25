@@ -6,8 +6,9 @@ use chrono::{Duration, Utc};
 use tokio::sync::{mpsc, Notify, RwLock};
 use tracing::{debug, warn};
 
-use crate::clipboard::ClipboardEntry;
+use crate::clipboard::{ClipboardEntry, ClipboardMonitor};
 use crate::error::Result;
+use crate::media::OutgoingMediaRegistry;
 use crate::network::protocol::ClipboardMessage;
 use crate::network::{DiscoveredPeer, NetworkCommand, NetworkStatus};
 use crate::security::PairingSession;
@@ -77,6 +78,18 @@ pub struct AppState {
     /// Message buffers for offline peers.
     /// Maps peer_id -> buffered messages (messages WE sent that THEY missed).
     pub message_buffers: Arc<RwLock<HashMap<String, Vec<ClipboardMessage>>>>,
+
+    // =========================================================================
+    // Media transfer
+    // =========================================================================
+    /// Our libp2p peer id (set when network services start).
+    pub local_peer_id: Arc<RwLock<Option<String>>>,
+    /// Media we offered and will serve chunks for.
+    pub outgoing_media: Arc<OutgoingMediaRegistry>,
+    /// Shared with the network task for echo prevention when writing received media.
+    pub clipboard_monitor: Arc<RwLock<Option<Arc<ClipboardMonitor>>>>,
+    /// Serialises downloads: one media transfer at a time.
+    pub download_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl AppState {
@@ -103,6 +116,11 @@ impl AppState {
 
             // Sync message buffers (per-recipient)
             message_buffers: Arc::new(RwLock::new(HashMap::new())),
+
+            local_peer_id: Arc::new(RwLock::new(None)),
+            outgoing_media: Arc::new(OutgoingMediaRegistry::default()),
+            clipboard_monitor: Arc::new(RwLock::new(None)),
+            download_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -142,6 +160,58 @@ impl AppState {
 
         // Flush-on-write: persist clipboard history immediately
         if modified {
+            if let Err(e) = self.flush_clipboard_history().await {
+                warn!("Failed to flush clipboard history: {}", e);
+            }
+        }
+    }
+
+    /// Mutate one history entry in place, flush, and return the updated copy.
+    pub async fn update_clipboard_entry(
+        &self,
+        entry_id: &str,
+        update: impl FnOnce(&mut ClipboardEntry),
+    ) -> Option<ClipboardEntry> {
+        let updated = {
+            let mut history = self.clipboard_history.write().await;
+            let entry = history.iter_mut().find(|e| e.id == entry_id)?;
+            update(entry);
+            entry.clone()
+        };
+        if let Err(e) = self.flush_clipboard_history().await {
+            warn!("Failed to flush clipboard history: {}", e);
+        }
+        Some(updated)
+    }
+
+    pub async fn find_clipboard_entry(&self, entry_id: &str) -> Option<ClipboardEntry> {
+        let history = self.clipboard_history.read().await;
+        history.iter().find(|e| e.id == entry_id).cloned()
+    }
+
+    /// Fix up media entries loaded from the vault: downloads cannot survive a
+    /// restart, and the cache is cleared on startup.
+    pub async fn normalize_media_entries(&self) {
+        use crate::clipboard::MediaStatus;
+
+        let changed = {
+            let mut history = self.clipboard_history.write().await;
+            let mut changed = false;
+            for media in history.iter_mut().filter_map(|e| e.media.as_mut()) {
+                let file_exists = media.local_path.as_ref().is_some_and(|p| p.is_file());
+                let status = match media.status {
+                    MediaStatus::Downloading => MediaStatus::Pending,
+                    MediaStatus::Ready if !file_exists => MediaStatus::Expired,
+                    other => other,
+                };
+                if status != media.status {
+                    media.status = status;
+                    changed = true;
+                }
+            }
+            changed
+        };
+        if changed {
             if let Err(e) = self.flush_clipboard_history().await {
                 warn!("Failed to flush clipboard history: {}", e);
             }

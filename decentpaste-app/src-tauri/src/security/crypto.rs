@@ -1,5 +1,5 @@
 use aes_gcm::{
-    aead::{rand_core::RngCore, Aead, KeyInit, OsRng},
+    aead::{rand_core::RngCore, Aead, KeyInit, OsRng, Payload},
     Aes256Gcm, Nonce,
 };
 use sha2::{Digest, Sha256};
@@ -64,9 +64,70 @@ pub fn decrypt_content(encrypted: &[u8], shared_secret: &[u8]) -> Result<Vec<u8>
         .map_err(|e| DecentPasteError::Encryption(e.to_string()))
 }
 
+/// Like `encrypt_content`, but binds `aad` into the GCM tag. Media chunks use
+/// `hash‖index` as AAD so a chunk cannot be replayed at another position or
+/// spliced in from another transfer.
+pub fn encrypt_content_with_aad(
+    content: &[u8],
+    shared_secret: &[u8],
+    aad: &[u8],
+) -> Result<Vec<u8>> {
+    let cipher = Aes256Gcm::new_from_slice(shared_secret)
+        .map_err(|e| DecentPasteError::Encryption(e.to_string()))?;
+
+    let mut nonce_bytes = [0u8; NONCE_SIZE];
+    OsRng.fill_bytes(&mut nonce_bytes);
+    let nonce = Nonce::from_slice(&nonce_bytes);
+
+    let ciphertext = cipher
+        .encrypt(nonce, Payload { msg: content, aad })
+        .map_err(|e| DecentPasteError::Encryption(e.to_string()))?;
+
+    let mut result = nonce_bytes.to_vec();
+    result.extend(ciphertext);
+    Ok(result)
+}
+
+pub fn decrypt_content_with_aad(
+    encrypted: &[u8],
+    shared_secret: &[u8],
+    aad: &[u8],
+) -> Result<Vec<u8>> {
+    if encrypted.len() < NONCE_SIZE {
+        return Err(DecentPasteError::Encryption("Data too short".into()));
+    }
+
+    let cipher = Aes256Gcm::new_from_slice(shared_secret)
+        .map_err(|e| DecentPasteError::Encryption(e.to_string()))?;
+
+    let (nonce_bytes, ciphertext) = encrypted.split_at(NONCE_SIZE);
+    cipher
+        .decrypt(
+            Nonce::from_slice(nonce_bytes),
+            Payload {
+                msg: ciphertext,
+                aad,
+            },
+        )
+        .map_err(|e| DecentPasteError::Encryption(e.to_string()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_aad_round_trip_and_mismatch() {
+        let key = [7u8; 32];
+        let encrypted = encrypt_content_with_aad(b"chunk", &key, b"hash:0").unwrap();
+
+        assert_eq!(
+            decrypt_content_with_aad(&encrypted, &key, b"hash:0").unwrap(),
+            b"chunk"
+        );
+        assert!(decrypt_content_with_aad(&encrypted, &key, b"hash:1").is_err());
+        assert!(decrypt_content_with_aad(&encrypted, &[8u8; 32], b"hash:0").is_err());
+    }
 
     #[test]
     fn test_hash_content() {

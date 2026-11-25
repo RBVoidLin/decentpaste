@@ -87,32 +87,77 @@ pub struct PairingConfirm {
 pub struct ClipboardMessage {
     pub id: String,
     pub content_hash: String,
+    /// Text: the encrypted text. Image/File: an encrypted `MediaManifest` (JSON);
+    /// the bytes themselves are pulled separately over the media protocol.
     pub encrypted_content: Vec<u8>,
     pub timestamp: DateTime<Utc>,
     pub origin_device_id: String,
     pub origin_device_name: String,
-    #[serde(default = "default_content_type")]
-    pub content_type: ContentType,
     #[serde(default)]
-    pub file_meta: Option<FileMeta>,
+    pub content_type: ContentType,
+    /// Peer this copy is encrypted for. Gossipsub delivers every per-peer copy to
+    /// every subscriber, so receivers skip copies addressed to someone else.
+    #[serde(default)]
+    pub target_peer_id: Option<String>,
 }
 
-fn default_content_type() -> ContentType {
-    ContentType::Text
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub enum ContentType {
     #[default]
     Text,
+    /// Raw image data from the clipboard (e.g. a screenshot), transferred as PNG.
+    Image,
+    /// A file copied in Finder / Explorer.
     File,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FileMeta {
+impl ContentType {
+    pub fn is_media(self) -> bool {
+        matches!(self, ContentType::Image | ContentType::File)
+    }
+}
+
+/// Describes a media item offered by its sender. Sent encrypted inside a
+/// `ClipboardMessage`; the receiver uses it to pull and verify the chunks.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MediaManifest {
+    pub kind: ContentType,
     pub name: String,
     pub size: u64,
     pub mime_type: String,
+    /// SHA-256 (hex) of the full payload; also used as `content_hash`.
+    pub sha256: String,
+    pub chunk_size: u32,
+    pub chunk_count: u32,
+    #[serde(default)]
+    pub width: Option<u32>,
+    #[serde(default)]
+    pub height: Option<u32>,
+}
+
+impl MediaManifest {
+    pub fn chunk_count_for(size: u64, chunk_size: u32) -> u32 {
+        size.div_ceil(chunk_size as u64) as u32
+    }
+
+    /// Structural checks a receiver must run before trusting a manifest.
+    pub fn validate(&self, max_size: u64) -> Result<(), String> {
+        if !self.kind.is_media() {
+            return Err("manifest kind is not media".into());
+        }
+        if self.size == 0 || self.size > max_size {
+            return Err(format!("invalid media size {}", self.size));
+        }
+        if self.chunk_size == 0
+            || self.chunk_count != Self::chunk_count_for(self.size, self.chunk_size)
+        {
+            return Err("chunk layout does not match size".into());
+        }
+        if self.sha256.len() != 64 || !self.sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err("invalid sha256".into());
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
