@@ -186,6 +186,7 @@ pub async fn remove_paired_peer(
     }
     // Flush-on-write: persist immediately to prevent data loss
     state.flush_paired_peers().await?;
+    state.outgoing_media.revoke_peer(&peer_id).await;
 
     // Emit directly using the info we have from the paired peer
     // This ensures the peer appears in discovered list with correct device name
@@ -455,6 +456,50 @@ pub async fn get_clipboard_history(
 pub async fn set_clipboard(app_handle: AppHandle, content: String) -> Result<()> {
     crate::clipboard::monitor::set_clipboard_content(&app_handle, &content)
         .map_err(DecentPasteError::Clipboard)
+}
+
+/// Download a media entry that was not fetched automatically (larger than the
+/// auto-download threshold, or a failed earlier attempt), then put it on the clipboard.
+#[tauri::command]
+pub async fn download_media(app_handle: AppHandle, entry_id: String) -> Result<ClipboardEntry> {
+    crate::media::download::download(&app_handle, &entry_id).await
+}
+
+/// Put an already-available media entry back on the clipboard.
+#[tauri::command]
+pub async fn copy_media_to_clipboard(
+    app_handle: AppHandle,
+    state: State<'_, AppState>,
+    entry_id: String,
+) -> Result<()> {
+    use crate::clipboard::MediaStatus;
+    use tauri::Emitter;
+
+    let entry = state
+        .find_clipboard_entry(&entry_id)
+        .await
+        .ok_or_else(|| DecentPasteError::InvalidInput("Clipboard entry not found".into()))?;
+    let media = entry
+        .media
+        .as_ref()
+        .ok_or_else(|| DecentPasteError::InvalidInput("Entry is not media".into()))?;
+
+    // Remote copies are marked as seen; re-copying our own item sends it out again.
+    let result =
+        crate::media::download::apply_to_clipboard(&app_handle, media, !entry.is_local).await;
+    if result.is_err() && media.local_path.as_ref().is_none_or(|p| !p.is_file()) {
+        if let Some(updated) = state
+            .update_clipboard_entry(&entry_id, |e| {
+                if let Some(m) = e.media.as_mut() {
+                    m.status = MediaStatus::Expired;
+                }
+            })
+            .await
+        {
+            let _ = app_handle.emit("clipboard-entry-updated", &updated);
+        }
+    }
+    result
 }
 
 #[tauri::command]
@@ -1350,7 +1395,7 @@ async fn share_clipboard_content(
     content: String,
 ) -> Result<()> {
     use crate::clipboard::ClipboardEntry;
-    use crate::network::{ClipboardMessage, NetworkCommand};
+    use crate::network::{ClipboardMessage, ContentType, NetworkCommand};
     use crate::security::{encrypt_content, hash_content};
     use chrono::Utc;
     use tauri::Emitter;
@@ -1392,6 +1437,8 @@ async fn share_clipboard_content(
             timestamp: Utc::now(),
             origin_device_id: identity.device_id.clone(),
             origin_device_name: identity.device_name.clone(),
+            content_type: ContentType::Text,
+            target_peer_id: Some(peer.peer_id.clone()),
         };
 
         // Send via network

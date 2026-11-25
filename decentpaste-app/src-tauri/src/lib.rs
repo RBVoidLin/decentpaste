@@ -1,6 +1,7 @@
 mod clipboard;
 mod commands;
 mod error;
+mod media;
 mod network;
 mod security;
 mod state;
@@ -14,13 +15,18 @@ use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+use uuid::Uuid;
 
-use clipboard::{ClipboardChange, ClipboardEntry, ClipboardMonitor};
-use network::{ClipboardMessage, NetworkCommand, NetworkEvent, NetworkManager};
+use clipboard::{
+    ClipboardChange, ClipboardContent, ClipboardEntry, ClipboardMonitor, MediaInfo, MediaStatus,
+};
+use network::{
+    ClipboardMessage, ContentType, MediaManifest, NetworkCommand, NetworkEvent, NetworkManager,
+};
 use state::AppState;
 #[cfg(any(target_os = "android", target_os = "ios"))]
 use state::PendingClipboard;
-use storage::{init_data_dir, load_settings};
+use storage::{cleanup_cache, get_data_dir, init_data_dir, init_file_cache, load_settings};
 use vault::{VaultManager, VaultStatus};
 
 /// Track whether network services have been started (to prevent double-start)
@@ -32,7 +38,7 @@ pub fn run() {
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "decentpaste_app=debug,libp2p=info".into()),
+                .unwrap_or_else(|_| "decentpaste_app_lib=debug,libp2p=info".into()),
         )
         .with(tracing_subscriber::fmt::layer())
         .init();
@@ -166,6 +172,9 @@ pub fn run() {
             // Connection management
             commands::refresh_connections,
             commands::refresh_discovery,
+            // Media transfer
+            commands::download_media,
+            commands::copy_media_to_clipboard,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
@@ -333,6 +342,15 @@ async fn initialize_app(
     // Initialize data directory first (required for all storage operations)
     init_data_dir(&app_handle)?;
 
+    // Initialize file cache (for clipboard file transfer)
+    let data_dir = get_data_dir()?;
+    init_file_cache(&data_dir)?;
+
+    // Clean up expired cache files on startup
+    if let Err(e) = cleanup_cache() {
+        warn!("Failed to cleanup file cache: {}", e);
+    }
+
     let state = app_handle.state::<AppState>();
 
     // Load settings (always available - not sensitive)
@@ -430,6 +448,9 @@ pub async fn start_network_services(
     };
     info!("Loaded libp2p keypair from vault");
 
+    *state.local_peer_id.write().await = Some(libp2p_keypair.public().to_peer_id().to_string());
+    state.normalize_media_entries().await;
+
     // Create channels
     let (network_cmd_tx, network_cmd_rx) = mpsc::channel::<NetworkCommand>(100);
     let (network_event_tx, mut network_event_rx) = mpsc::channel::<NetworkEvent>(100);
@@ -507,15 +528,42 @@ pub async fn start_network_services(
                         continue;
                     }
 
+                    // Text travels inline; media sends only its manifest and is
+                    // registered so peers can pull the bytes over the media protocol.
+                    let (content_bytes, media) = match &change.content {
+                        ClipboardContent::Text { content } => (content.as_bytes().to_vec(), None),
+                        ClipboardContent::Media { path, manifest } => {
+                            let bytes = match serde_json::to_vec(manifest) {
+                                Ok(bytes) => bytes,
+                                Err(e) => {
+                                    error!("Failed to serialize media manifest: {}", e);
+                                    continue;
+                                }
+                            };
+                            state
+                                .outgoing_media
+                                .register(
+                                    path.clone(),
+                                    manifest.clone(),
+                                    paired_peers.iter().map(|p| p.peer_id.clone()).collect(),
+                                )
+                                .await;
+                            let media = MediaInfo {
+                                manifest: manifest.clone(),
+                                source_peer_id: None,
+                                local_path: Some(path.clone()),
+                                status: MediaStatus::Ready,
+                            };
+                            (bytes, Some(media))
+                        }
+                    };
+
                     // Encrypt and broadcast to EACH paired peer with their specific shared secret
                     // ALSO buffer for each peer - this handles the case where a peer goes offline
                     // mid-transmission (race condition). Sync will deliver the message later.
                     let mut broadcast_count = 0;
                     for peer in paired_peers.iter() {
-                        match security::encrypt_content(
-                            change.content.as_bytes(),
-                            &peer.shared_secret,
-                        ) {
+                        match security::encrypt_content(&content_bytes, &peer.shared_secret) {
                             Ok(encrypted) => {
                                 let msg = ClipboardMessage {
                                     id: uuid::Uuid::new_v4().to_string(),
@@ -524,6 +572,8 @@ pub async fn start_network_services(
                                     timestamp: Utc::now(),
                                     origin_device_id: identity.device_id.clone(),
                                     origin_device_name: identity.device_name.clone(),
+                                    content_type: change.content.content_type(),
+                                    target_peer_id: Some(peer.peer_id.clone()),
                                 };
 
                                 // 1. Send via gossipsub (fire-and-forget)
@@ -554,11 +604,18 @@ pub async fn start_network_services(
 
                     if broadcast_count > 0 {
                         // Add to history (once, not per peer)
-                        let entry = ClipboardEntry::new_local(
-                            change.content,
-                            &identity.device_id,
-                            &identity.device_name,
-                        );
+                        let preview = change.content.preview_text();
+                        let entry = ClipboardEntry {
+                            id: Uuid::new_v4().to_string(),
+                            content: preview,
+                            content_hash: change.content_hash.clone(),
+                            timestamp: Utc::now(),
+                            origin_device_id: identity.device_id.clone(),
+                            origin_device_name: identity.device_name.clone(),
+                            is_local: true,
+                            content_type: change.content.content_type(),
+                            media,
+                        };
                         state.add_clipboard_entry(entry.clone()).await;
 
                         // Emit to frontend
@@ -1027,93 +1084,39 @@ pub async fn start_network_services(
                         continue;
                     }
 
-                    // Check if from paired peer
-                    let paired_peers = state.paired_peers.read().await;
-
-                    // Find the peer's shared secret
-                    // Try decrypting with each paired peer's secret until one succeeds
-                    let mut decrypted_successfully = false;
-                    for peer in paired_peers.iter() {
-                        match security::decrypt_content(&msg.encrypted_content, &peer.shared_secret)
-                        {
-                            Ok(decrypted) => {
-                                if let Ok(content) = String::from_utf8(decrypted) {
-                                    // Verify hash
-                                    let hash = security::hash_content(&content);
-                                    if hash == msg.content_hash {
-                                        decrypted_successfully = true;
-
-                                        // Check if we should queue for background (mobile only)
-                                        #[cfg(any(target_os = "android", target_os = "ios"))]
-                                        let is_foreground = *state.is_foreground.read().await;
-                                        #[cfg(not(any(target_os = "android", target_os = "ios")))]
-                                        let is_foreground = true;
-
-                                        if is_foreground {
-                                            // Prevent echo: register the hash *before* writing,
-                                            // or a poll landing between the two reads it back as
-                                            // a local change and re-broadcasts it to the sender.
-                                            clipboard_monitor.set_last_hash(hash.clone()).await;
-
-                                            // Update local clipboard directly
-                                            if let Err(e) =
-                                                clipboard::monitor::set_clipboard_content(
-                                                    &app_handle_network,
-                                                    &content,
-                                                )
-                                            {
-                                                error!("Failed to set clipboard: {}", e);
-                                            }
-                                        } else {
-                                            // Mobile background: queue clipboard silently (no notification)
-                                            // Clipboard will be copied when app resumes
-                                            #[cfg(any(target_os = "android", target_os = "ios"))]
-                                            {
-                                                info!(
-                                                    "App in background, queuing clipboard from {} (silent)",
-                                                    msg.origin_device_name
-                                                );
-
-                                                // Store pending clipboard - will be processed on resume
-                                                {
-                                                    let mut pending =
-                                                        state.pending_clipboard.write().await;
-                                                    *pending = Some(PendingClipboard {
-                                                        content: content.clone(),
-                                                        from_device: msg.origin_device_name.clone(),
-                                                    });
-                                                }
-                                            }
-                                        }
-
-                                        // Add to history (always, even for duplicates - moved to front)
-                                        let entry = ClipboardEntry::new_remote(
-                                            content,
-                                            msg.content_hash.clone(),
-                                            msg.timestamp,
-                                            &msg.origin_device_id,
-                                            &msg.origin_device_name,
-                                        );
-                                        state.add_clipboard_entry(entry.clone()).await;
-
-                                        // Emit to frontend
-                                        let _ =
-                                            app_handle_network.emit("clipboard-received", entry);
-
-                                        break;
-                                    }
-                                }
-                            }
-                            Err(_) => continue,
+                    // Gossipsub delivers every per-peer copy to every subscriber.
+                    if let Some(target) = &msg.target_peer_id {
+                        if state.local_peer_id.read().await.as_ref() != Some(target) {
+                            continue;
                         }
                     }
 
-                    if !decrypted_successfully && !paired_peers.is_empty() {
-                        tracing::warn!(
+                    // The copy is encrypted for us with the sender's shared secret.
+                    let decrypted = {
+                        let paired_peers = state.paired_peers.read().await;
+                        paired_peers.iter().find_map(|peer| {
+                            security::decrypt_content(&msg.encrypted_content, &peer.shared_secret)
+                                .ok()
+                                .map(|plain| (peer.peer_id.clone(), plain))
+                        })
+                    };
+                    let Some((peer_id, plain)) = decrypted else {
+                        warn!(
                             "Failed to decrypt clipboard message from {} - no paired peer could decrypt it",
                             msg.origin_device_name
                         );
-                    }
+                        continue;
+                    };
+
+                    receive_clipboard_message(
+                        &app_handle_network,
+                        &clipboard_monitor,
+                        &peer_id,
+                        &msg,
+                        plain,
+                        false,
+                    )
+                    .await;
                 }
 
                 NetworkEvent::ClipboardSent { id, peer_count } => {
@@ -1286,90 +1289,53 @@ pub async fn start_network_services(
 
                 NetworkEvent::SyncContentReceived { peer_id, message } => {
                     // We received full content for a hash we requested.
-                    // Decrypt, verify, and add to clipboard history.
-
-                    // Security: verify peer is paired
-                    if !state.is_peer_paired(&peer_id).await {
+                    let shared_secret = {
+                        let paired_peers = state.paired_peers.read().await;
+                        paired_peers
+                            .iter()
+                            .find(|p| p.peer_id == peer_id)
+                            .map(|p| p.shared_secret.clone())
+                    };
+                    let Some(shared_secret) = shared_secret else {
                         warn!(
                             "Ignoring SyncContentReceived from unpaired peer: {}",
                             peer_id
                         );
                         continue;
-                    }
+                    };
 
-                    // Try to decrypt with paired peer's shared secret
-                    let paired_peers = state.paired_peers.read().await;
-
-                    // Find the peer and decrypt
-                    if let Some(peer) = paired_peers.iter().find(|p| p.peer_id == peer_id) {
-                        match security::decrypt_content(
-                            &message.encrypted_content,
-                            &peer.shared_secret,
-                        ) {
-                            Ok(decrypted) => {
-                                if let Ok(content) = String::from_utf8(decrypted) {
-                                    // Verify hash
-                                    let hash = security::hash_content(&content);
-                                    if hash == message.content_hash {
-                                        // Check deduplication - don't apply if already in history
-                                        let already_has = {
-                                            let history = state.clipboard_history.read().await;
-                                            history.iter().any(|entry| entry.content_hash == hash)
-                                        };
-
-                                        if !already_has {
-                                            // Prevent echo: register the hash *before* writing,
-                                            // or a poll landing between the two reads it back as
-                                            // a local change and re-broadcasts it to the sender.
-                                            clipboard_monitor.set_last_hash(hash.clone()).await;
-
-                                            // Set clipboard
-                                            if let Err(e) =
-                                                clipboard::monitor::set_clipboard_content(
-                                                    &app_handle_network,
-                                                    &content,
-                                                )
-                                            {
-                                                error!("Failed to set synced clipboard: {}", e);
-                                            }
-
-                                            // Add to history with correct timestamp
-                                            let entry = ClipboardEntry::new_remote(
-                                                content,
-                                                message.content_hash.clone(),
-                                                message.timestamp,
-                                                &message.origin_device_id,
-                                                &message.origin_device_name,
-                                            );
-                                            // Use add_clipboard_entry which handles chronological insertion
-                                            state.add_clipboard_entry(entry.clone()).await;
-
-                                            // Emit to frontend (use same event as regular clipboard-received)
-                                            let _ = app_handle_network
-                                                .emit("clipboard-received", entry);
-
-                                            info!(
-                                                "Synced clipboard from {} (hash: {})",
-                                                message.origin_device_name,
-                                                &hash[..8.min(hash.len())]
-                                            );
-                                        } else {
-                                            debug!(
-                                                "Synced message already in history (deduplicated)"
-                                            );
-                                        }
-                                    } else {
-                                        warn!("Hash mismatch in synced message from {}", peer_id);
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                error!("Failed to decrypt synced content from {}: {}", peer_id, e);
-                            }
+                    match security::decrypt_content(&message.encrypted_content, &shared_secret) {
+                        Ok(plain) => {
+                            receive_clipboard_message(
+                                &app_handle_network,
+                                &clipboard_monitor,
+                                &peer_id,
+                                &message,
+                                plain,
+                                true,
+                            )
+                            .await;
                         }
-                    } else {
-                        warn!("Received sync content from unknown peer: {}", peer_id);
+                        Err(e) => {
+                            error!("Failed to decrypt synced content from {}: {}", peer_id, e);
+                        }
                     }
+                }
+
+                NetworkEvent::MediaChunkRequested {
+                    key,
+                    peer_id,
+                    sha256,
+                    index,
+                } => {
+                    // Off the event loop: reading and encrypting a chunk takes a moment.
+                    tokio::spawn(media::download::serve_chunk(
+                        app_handle_network.clone(),
+                        key,
+                        peer_id,
+                        sha256,
+                        index,
+                    ));
                 }
             }
         }
@@ -1378,4 +1344,104 @@ pub async fn start_network_services(
     start_guard.armed = false;
     info!("Network services started successfully");
     Ok(())
+}
+
+/// Handle a decrypted clipboard message from `peer_id`, delivered live or via sync.
+async fn receive_clipboard_message(
+    app_handle: &AppHandle,
+    clipboard_monitor: &ClipboardMonitor,
+    peer_id: &str,
+    msg: &ClipboardMessage,
+    plain: Vec<u8>,
+    from_sync: bool,
+) {
+    let state = app_handle.state::<AppState>();
+
+    if from_sync {
+        let already_has = {
+            let history = state.clipboard_history.read().await;
+            history
+                .iter()
+                .any(|entry| entry.content_hash == msg.content_hash)
+        };
+        if already_has {
+            debug!("Synced message already in history (deduplicated)");
+            return;
+        }
+    }
+
+    match msg.content_type {
+        ContentType::Text => {
+            let Ok(content) = String::from_utf8(plain) else {
+                warn!("Received non-UTF-8 text from {}", peer_id);
+                return;
+            };
+            let hash = security::hash_content(&content);
+            if hash != msg.content_hash {
+                warn!("Hash mismatch in clipboard message from {}", peer_id);
+                return;
+            }
+
+            // Mobile: queue clipboard while backgrounded
+            #[cfg(any(target_os = "android", target_os = "ios"))]
+            let is_foreground = *state.is_foreground.read().await;
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
+            let is_foreground = true;
+
+            if is_foreground {
+                // Prevent echo, then update local clipboard
+                clipboard_monitor.set_last_hash(hash.clone()).await;
+                if let Err(e) = clipboard::monitor::set_clipboard_content(app_handle, &content) {
+                    error!("Failed to set clipboard: {}", e);
+                }
+            } else {
+                #[cfg(any(target_os = "android", target_os = "ios"))]
+                {
+                    let mut pending = state.pending_clipboard.write().await;
+                    *pending = Some(PendingClipboard {
+                        content: content.clone(),
+                        from_device: msg.origin_device_name.clone(),
+                    });
+                }
+            }
+
+            let mut entry = ClipboardEntry::new_remote(
+                content,
+                msg.content_hash.clone(),
+                msg.timestamp,
+                &msg.origin_device_id,
+                &msg.origin_device_name,
+            );
+            entry.content_type = ContentType::Text;
+            state.add_clipboard_entry(entry.clone()).await;
+            let _ = app_handle.emit("clipboard-received", entry);
+
+            if from_sync {
+                info!(
+                    "Synced clipboard from {} (hash: {})",
+                    msg.origin_device_name,
+                    &hash[..8.min(hash.len())]
+                );
+            }
+        }
+
+        ContentType::Image | ContentType::File => {
+            let manifest: MediaManifest = match serde_json::from_slice(&plain) {
+                Ok(manifest) => manifest,
+                Err(e) => {
+                    warn!("Invalid media manifest from {}: {}", peer_id, e);
+                    return;
+                }
+            };
+            if let Err(e) = manifest.validate(media::MAX_MEDIA_SIZE) {
+                warn!("Rejected media manifest from {}: {}", peer_id, e);
+                return;
+            }
+            if manifest.sha256 != msg.content_hash || manifest.kind != msg.content_type {
+                warn!("Media manifest from {} does not match its message", peer_id);
+                return;
+            }
+            media::download::handle_incoming_offer(app_handle, peer_id, msg, manifest).await;
+        }
+    }
 }

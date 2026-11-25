@@ -46,6 +46,9 @@ zeroize.workspace = true
 
 # Storage & utilities
 hostname.workspace = true
+mime_guess.workspace = true
+image.workspace = true
+unicode-normalization.workspace = true
 thiserror.workspace = true
 anyhow.workspace = true
 chrono.workspace = true
@@ -64,3 +67,4 @@ async-trait.workspace = true
 tauri-plugin-single-instance.workspace = true
 tauri-plugin-autostart.workspace = true
 tauri-plugin-global-shortcut.workspace = true
+clipboard-rs.workspace = true

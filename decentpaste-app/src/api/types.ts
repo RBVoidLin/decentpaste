@@ -23,14 +23,40 @@ export interface ConnectedPeer {
 }
 
 // Clipboard types
+export type ContentType = 'Text' | 'Image' | 'File';
+
+export type MediaStatus = 'Pending' | 'Downloading' | 'Ready' | 'Failed' | 'Expired';
+
+export interface MediaManifest {
+  kind: ContentType;
+  name: string;
+  size: number;
+  mime_type: string;
+  sha256: string;
+  chunk_size: number;
+  chunk_count: number;
+  width: number | null;
+  height: number | null;
+}
+
+export interface MediaInfo {
+  manifest: MediaManifest;
+  source_peer_id: string | null;
+  local_path: string | null;
+  status: MediaStatus;
+}
+
 export interface ClipboardEntry {
   id: string;
+  /** Text content, or a label for media entries */
   content: string;
   content_hash: string;
   timestamp: string;
   origin_device_id: string;
   origin_device_name: string;
   is_local: boolean;
+  content_type?: ContentType;
+  media?: MediaInfo | null;
 }
 
 // Pairing types

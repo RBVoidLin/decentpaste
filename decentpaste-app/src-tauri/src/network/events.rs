@@ -120,4 +120,12 @@ pub enum NetworkEvent {
         peer_id: String,
         message: ClipboardMessage,
     },
+
+    /// A peer asked for a media chunk. Answer with `NetworkCommand::SendMediaChunk { key, .. }`.
+    MediaChunkRequested {
+        key: u64,
+        peer_id: String,
+        sha256: String,
+        index: u32,
+    },
 }
