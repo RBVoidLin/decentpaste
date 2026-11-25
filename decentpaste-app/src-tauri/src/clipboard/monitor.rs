@@ -381,6 +381,7 @@ fn spawn_watcher(
                     watcher.add_handler(Handler(signal_tx));
                     let _ = shutdown_tx.send(Some(watcher.get_shutdown_channel()));
                     watcher.start_watch();
+                    debug!("Clipboard watcher thread exited");
                 }
                 Err(e) => {
                     tracing::error!("Failed to start clipboard watcher: {}", e);
